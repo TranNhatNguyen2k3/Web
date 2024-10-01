@@ -13,6 +13,7 @@
     "build": "quasar build"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.16",
     "@quasar/extras": "^1.16.4",
     "axios": "^1.7.7",
     "core-js": "^3.31.1",

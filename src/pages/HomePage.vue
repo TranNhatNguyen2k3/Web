@@ -1,202 +1,179 @@
 <template>
-  <q-page padding>
-    <div class="video-container">
-      <div class="local-video-wrapper">
-        <video id="localVideo" autoplay muted class="local-video"></video>
+  <q-page class="flex flex-center bg-light">
+    <div class="q-gutter-md container">
+      <q-btn
+        @click="enableCam"
+        :label="webcamRunning ? 'Disable Webcam' : 'Enable Webcam'"
+        color="primary"
+        class="q-mb-md"
+        style="width: 200px"
+      />
+      <div class="video-container">
+        <video ref="webcam" autoplay playsinline muted class="video" />
+        <canvas ref="outputCanvas" class="canvas" />
+      </div>
+      <div v-if="gestureOutput" class="q-mt-md">
+        <q-card>
+          <q-card-section class="text-center">
+            <h5 class="text-h6">Gesture Output</h5>
+            <div>{{ gestureOutput }}</div>
+          </q-card-section>
+        </q-card>
       </div>
     </div>
   </q-page>
 </template>
 
-<script setup>
-import { ref, onMounted } from "vue";
-import Peer from "peerjs";
-import axios from "axios";
-const userId = ref(localStorage.getItem("userId") || "");
-const peerId = ref("");
-const error = ref("");
-const remoteStreams = ref({});
-const roomId = ref("");
-let localPeer;
-let localStream;
-let currentCalls = {};
-let screenStream = null;
+<script>
+import {
+  GestureRecognizer,
+  FilesetResolver,
+  DrawingUtils,
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
 
-onMounted(() => {
-  initializePeer();
-  getLocalStream();
-});
-function initializePeer() {
-  localPeer = new Peer(undefined, {
-    stunServers: "stun:stun.l.google.com:19302",
-  });
+export default {
+  data() {
+    return {
+      gestureRecognizer: null,
+      webcamRunning: false,
+      gestureOutput: "",
+      lastVideoTime: -1,
+    };
+  },
+  async mounted() {
+    await this.createGestureRecognizer();
+  },
+  methods: {
+    async createGestureRecognizer() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+      );
+      this.gestureRecognizer = await GestureRecognizer.createFromOptions(
+        vision,
+        {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+        }
+      );
+    },
+    async enableCam() {
+      if (!this.gestureRecognizer) {
+        alert("Please wait for the gesture recognizer to load");
+        return;
+      }
 
-  localPeer.on("open", (id) => {
-    peerId.value = id;
-    createUser();
-  });
+      this.webcamRunning = !this.webcamRunning;
 
-  localPeer.on("call", handleIncomingCall);
-}
+      if (this.webcamRunning) {
+        this.$refs.webcam.srcObject = await navigator.mediaDevices.getUserMedia(
+          { video: true }
+        );
+        this.$refs.webcam.addEventListener("loadeddata", this.predictWebcam);
+      } else {
+        this.$refs.webcam.srcObject
+          .getTracks()
+          .forEach((track) => track.stop());
+        this.gestureOutput = "";
+      }
+    },
+    async predictWebcam() {
+      let nowInMs = Date.now();
 
-async function getLocalStream() {
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
-    document.getElementById("localVideo").srcObject = localStream;
-  } catch (err) {
-    handleError("Failed to get local stream: " + err.message);
-  }
-}
-async function createUser() {
-  if (!userId.value || !peerId.value) {
-    return handleError("Please enter both User ID and Peer ID");
-  }
+      if (this.lastVideoTime !== this.$refs.webcam.currentTime) {
+        this.lastVideoTime = this.$refs.webcam.currentTime;
+        const results = this.gestureRecognizer.recognizeForVideo(
+          this.$refs.webcam,
+          nowInMs
+        );
 
-  try {
-    await axios.post("https://192.168.1.6:3000/api/save-peer-id", {
-      userId: userId.value,
-      peerId: peerId.value,
-    });
-    clearError();
-  } catch (err) {
-    handleError("Failed to save User ID and Peer ID: " + err.message);
-  }
-}
-async function callUser(contactUserId) {
-  try {
-    const response = await axios.get(
-      `https://192.168.1.6:3000/api/get-peer-id/${contactUserId}`
-    );
+        const canvasCtx = this.$refs.outputCanvas.getContext("2d");
+        canvasCtx.clearRect(
+          0,
+          0,
+          this.$refs.outputCanvas.width,
+          this.$refs.outputCanvas.height
+        );
 
-    const peerIdToCall = response.data.peerId;
+        const drawingUtils = new DrawingUtils(canvasCtx);
+        this.$refs.outputCanvas.width = this.$refs.webcam.videoWidth;
+        this.$refs.outputCanvas.height = this.$refs.webcam.videoHeight;
 
-    if (!peerIdToCall) {
-      return handleError("No Peer ID found for this User ID: " + contactUserId);
-    }
+        if (results.landmarks) {
+          for (const landmarks of results.landmarks) {
+            drawingUtils.drawConnectors(
+              landmarks,
+              GestureRecognizer.HAND_CONNECTIONS,
+              {
+                color: "#00FF00",
+                lineWidth: 5,
+              }
+            );
+            drawingUtils.drawLandmarks(landmarks, {
+              color: "#FF0000",
+              lineWidth: 2,
+            });
+          }
+        }
 
-    const call = localPeer.call(peerIdToCall, localStream);
-    handleCallStream(call);
-  } catch (err) {
-    handleError(
-      "Failed to retrieve Peer ID for user " +
-        contactUserId +
-        ": " +
-        err.message
-    );
-  }
-}
-function handleIncomingCall(call) {
-  call.answer(localStream);
-  handleCallStream(call);
-}
+        if (results.gestures.length > 0) {
+          const categoryName = results.gestures[0][0].categoryName;
+          const categoryScore = (results.gestures[0][0].score * 100).toFixed(2);
+          const handedness = results.handednesses[0][0].displayName;
+          this.gestureOutput = `GestureRecognizer: ${categoryName}\n Confidence: ${categoryScore}%\n Handedness: ${handedness}`;
+        } else {
+          this.gestureOutput = "";
+        }
+      }
 
-function handleCallStream(call) {
-  currentCalls[call.peer] = call;
-
-  call.on("stream", (remoteStream) => {
-    remoteStreams.value[call.peer] = remoteStream;
-    document.getElementById(`remoteVideo-${call.peer}`).srcObject =
-      remoteStream;
-  });
-
-  call.on("error", (err) => {
-    handleError("Failed to join call: " + err.message);
-  });
-
-  call.on("close", () => {
-    delete remoteStreams.value[call.peer];
-  });
-}
-function handleError(message) {
-  error.value = message;
-}
-
-function clearError() {
-  error.value = "";
-}
-
-function handleSuccess(message) {
-  console.log(message);
-}
+      if (this.webcamRunning) {
+        requestAnimationFrame(this.predictWebcam);
+      }
+    },
+  },
+};
 </script>
 
 <style scoped>
+.container {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 20px;
+  border-radius: 10px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+  background-color: white;
+}
+
 .video-container {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  margin-bottom: 20px;
-}
-
-.local-video-wrapper {
   position: relative;
-  width: 400px;
-  height: 300px;
-  margin-bottom: 10px;
-  border: 2px solid #007bff;
-  border-radius: 8px;
-}
-
-.local-video {
   width: 100%;
-  height: 100%;
-  border-radius: 8px;
+  overflow: hidden;
+  border-radius: 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
 }
 
-.remote-videos {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-}
-
-.remote-video-wrapper {
-  position: relative;
-  width: 400px;
-  height: 300px;
-  margin: 10px;
-  border: 2px solid #007bff;
-  border-radius: 8px;
-}
-
-.remote-video {
+.video {
   width: 100%;
-  height: 100%;
-  border-radius: 8px;
+  height: auto;
+  border-radius: 10px;
 }
 
-.user-id-overlay {
+.canvas {
   position: absolute;
-  bottom: 10px;
-  left: 10px;
-  color: white;
-  background-color: rgba(0, 0, 0, 0.7);
-  padding: 5px;
-  border-radius: 5px;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 10px;
+  pointer-events: none;  
 }
 
-.controls {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
-
-.room-input-container {
-  display: flex;
-  align-items: center;
-}
-
-.barcode-image {
-  margin-left: 10px;
-  height: 100px;
-  width: auto;
-}
-
-.error-message {
-  color: red;
-  text-align: center;
+.q-card {
+  background-color: #f7f7f7;  
+  border-radius: 10px;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
 }
 </style>
-
